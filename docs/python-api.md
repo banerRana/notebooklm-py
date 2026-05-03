@@ -1,7 +1,7 @@
 # Python API Reference
 
 **Status:** Active
-**Last Updated:** 2026-03-02
+**Last Updated:** 2026-03-12
 
 Complete reference for the `notebooklm` Python library.
 
@@ -31,8 +31,9 @@ async def main():
 
         # Generate a podcast
         status = await client.artifacts.generate_audio(nb.id)
-        final = await client.artifacts.wait_for_completion(nb.id, status.task_id)
-        print(f"Audio ready: {final.url}")
+        await client.artifacts.wait_for_completion(nb.id, status.task_id)
+        output_path = await client.artifacts.download_audio(nb.id, "podcast.mp3")
+        print(f"Audio saved to: {output_path}")
 
 asyncio.run(main())
 ```
@@ -68,6 +69,9 @@ The client requires valid Google session cookies obtained via browser login:
 client = await NotebookLMClient.from_storage()
 client = await NotebookLMClient.from_storage("/path/to/storage_state.json")
 
+# From a named profile
+client = await NotebookLMClient.from_storage(profile="work")
+
 # From AuthTokens directly
 from notebooklm import AuthTokens
 auth = AuthTokens(
@@ -76,6 +80,9 @@ auth = AuthTokens(
     session_id="..."
 )
 client = NotebookLMClient(auth)
+
+# AuthTokens also supports profiles
+auth = AuthTokens.from_storage(profile="work")
 ```
 
 **Environment Variable Support:**
@@ -85,13 +92,17 @@ The library respects these environment variables for authentication:
 | Variable | Description |
 |----------|-------------|
 | `NOTEBOOKLM_HOME` | Base directory for config files (default: `~/.notebooklm`) |
+| `NOTEBOOKLM_PROFILE` | Active profile name (default: `default`) |
 | `NOTEBOOKLM_AUTH_JSON` | Inline auth JSON - no file needed (for CI/CD) |
 
 **Precedence** (highest to lowest):
 1. Explicit `path` argument to `from_storage()`
 2. `NOTEBOOKLM_AUTH_JSON` environment variable
-3. `$NOTEBOOKLM_HOME/storage_state.json`
-4. `~/.notebooklm/storage_state.json`
+3. Explicit `profile` argument to `from_storage(profile="work")`
+4. `NOTEBOOKLM_PROFILE` environment variable (resolves to `~/.notebooklm/profiles/<name>/storage_state.json`)
+5. Active profile from `~/.notebooklm/active_profile`
+6. `~/.notebooklm/profiles/default/storage_state.json`
+7. `~/.notebooklm/storage_state.json` (legacy fallback)
 
 **CI/CD Example:**
 ```python
@@ -157,10 +168,21 @@ class NotebookLMClient:
     chat: ChatAPI              # Conversations
     research: ResearchAPI      # Web/Drive research
     notes: NotesAPI            # User notes
+    settings: SettingsAPI      # User settings (language, etc.)
     sharing: SharingAPI        # Notebook sharing
+    auth: AuthTokens           # Current authentication tokens
+    is_connected: bool         # Connection state
 
     @classmethod
-    async def from_storage(cls, path: str = None) -> "NotebookLMClient"
+    async def from_storage(
+        cls, path: str | None = None, timeout: float = 30.0,
+        profile: str | None = None
+    ) -> "NotebookLMClient"
+
+    def __init__(
+        self, auth: AuthTokens, timeout: float = 30.0,
+        storage_path: Path | None = None
+    )
 
     async def refresh_auth(self) -> AuthTokens
 ```
@@ -177,8 +199,10 @@ class NotebookLMClient:
 | `delete(notebook_id)` | `notebook_id: str` | `bool` | Delete a notebook |
 | `rename(notebook_id, new_title)` | `notebook_id: str, new_title: str` | `Notebook` | Rename a notebook |
 | `get_description(notebook_id)` | `notebook_id: str` | `NotebookDescription` | Get AI summary and topics |
+| `get_metadata(notebook_id)` | `notebook_id: str` | `NotebookMetadata` | Get notebook metadata and sources |
 | `get_summary(notebook_id)` | `notebook_id: str` | `str` | Get raw summary text |
-| `share(notebook_id, settings=None)` | `notebook_id: str, settings: dict` | `Any` | Share notebook with settings |
+| `share(notebook_id, public=True, artifact_id=None)` | `notebook_id: str, bool, str \| None` | `dict` | Create or update a share link |
+| `get_share_url(notebook_id, artifact_id=None)` | `notebook_id: str, str \| None` | `str` | Get a share URL |
 | `remove_from_recent(notebook_id)` | `notebook_id: str` | `None` | Remove from recently viewed |
 | `get_raw(notebook_id)` | `notebook_id: str` | `Any` | Get raw API response data |
 
@@ -203,8 +227,14 @@ for topic in desc.suggested_topics:
 summary = await client.notebooks.get_summary(nb.id)
 print(summary)
 
-# Share a notebook
-await client.notebooks.share(nb.id, settings={"public": True})
+# Get metadata for automation or exports
+metadata = await client.notebooks.get_metadata(nb.id)
+print(metadata.title)
+
+# Enable public sharing and fetch the URL
+await client.notebooks.share(nb.id, public=True)
+url = await client.notebooks.get_share_url(nb.id)
+print(url)
 ```
 
 **get_summary vs get_description:**
@@ -370,6 +400,7 @@ path = await client.artifacts.download_flashcards(nb_id, "cards.md", output_form
 - Mind map downloads return a JSON tree structure with `name` and `children` fields
 - Data table downloads parse the complex rich-text format into CSV rows/columns
 - Quiz/flashcard formats: `json` (structured), `markdown` (readable), `html` (raw)
+- Downloads automatically use the storage path from `from_storage(path=...)` or the resolved profile for cookie authentication
 
 #### Export Methods
 
@@ -440,11 +471,11 @@ status = await client.artifacts.generate_video(
 # Report
 status = await client.artifacts.generate_report(
     notebook_id,
+    report_format=ReportFormat.STUDY_GUIDE,  # BRIEFING_DOC, STUDY_GUIDE, BLOG_POST, CUSTOM
     source_ids=None,
-    title="...",
-    description="...",
-    format=ReportFormat.STUDY_GUIDE,  # BRIEFING_DOC, STUDY_GUIDE, BLOG_POST, CUSTOM
-    language="en"
+    language="en",
+    custom_prompt=None,          # Used with ReportFormat.CUSTOM
+    extra_instructions="..."     # Optional append for built-in formats
 )
 
 # Quiz
@@ -452,9 +483,8 @@ status = await client.artifacts.generate_quiz(
     notebook_id,
     source_ids=None,
     instructions="...",
-    quantity=QuizQuantity.STANDARD,    # FEWER, STANDARD
+    quantity=QuizQuantity.MORE,        # FEWER, STANDARD, MORE (MORE aliases STANDARD)
     difficulty=QuizDifficulty.MEDIUM,  # EASY, MEDIUM, HARD
-    language="en"
 )
 ```
 
@@ -473,7 +503,8 @@ final = await client.artifacts.wait_for_completion(
 )
 
 if final.is_complete:
-    print(f"Download URL: {final.url}")
+    path = await client.artifacts.download_audio(nb_id, "podcast.mp3")
+    print(f"Saved to: {path}")
 else:
     print(f"Failed or timed out: {final.status}")
 ```
@@ -646,6 +677,8 @@ await client.notes.delete_mind_map(nb_id, mind_map_id)
 | Method | Parameters | Returns | Description |
 |--------|------------|---------|-------------|
 | `get_output_language()` | none | `Optional[str]` | Get current output language setting |
+| `get_account_limits()` | none | `AccountLimits` | Get account-level limits such as max notebooks and sources per notebook |
+| `get_account_tier()` | none | `AccountTier` | Get current NotebookLM subscription tier |
 | `set_output_language(language)` | `str` | `Optional[str]` | Set output language for artifact generation |
 
 **Example:**
@@ -654,12 +687,20 @@ await client.notes.delete_mind_map(nb_id, mind_map_id)
 lang = await client.settings.get_output_language()
 print(f"Current language: {lang}")  # e.g., "en", "ja", "zh_Hans"
 
+# Get server-reported account limits
+limits = await client.settings.get_account_limits()
+print(f"Notebook limit: {limits.notebook_limit}")
+
+# Get current NotebookLM subscription tier
+tier = await client.settings.get_account_tier()
+print(f"Account tier: {tier.plan_name or tier.tier}")
+
 # Set language for artifact generation
 result = await client.settings.set_output_language("ja")  # Japanese
 print(f"Language set to: {result}")
 ```
 
-**Important:** Language is a **GLOBAL setting** that affects all notebooks in your account. Supported languages include:
+**Important:** Language is a **GLOBAL setting** that affects all notebooks in your account. The tier string is internal NotebookLM metadata; use `get_account_limits()` for quota decisions because the raw tier name may not match the active notebook/source limits. Supported languages include:
 - `en` (English), `ja` (日本語), `zh_Hans` (中文简体), `zh_Hant` (中文繁體)
 - `ko` (한국어), `es` (Español), `fr` (Français), `de` (Deutsch), `pt_BR` (Português)
 - And [over 70 other languages](cli-reference.md#language-commands-notebooklm-language-cmd)
@@ -966,6 +1007,7 @@ class VideoStyle(Enum):
 class QuizQuantity(Enum):
     FEWER = 1
     STANDARD = 2
+    MORE = 2  # Alias of STANDARD used by the CLI/web UI
 
 class QuizDifficulty(Enum):
     EASY = 1
@@ -1050,6 +1092,8 @@ class SourceType(str, Enum):
     PDF = "pdf"
     PASTED_TEXT = "pasted_text"
     WEB_PAGE = "web_page"
+    GOOGLE_DRIVE_AUDIO = "google_drive_audio"
+    GOOGLE_DRIVE_VIDEO = "google_drive_video"
     YOUTUBE = "youtube"
     MARKDOWN = "markdown"
     DOCX = "docx"
